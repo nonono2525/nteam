@@ -35,6 +35,8 @@ TEXT_SUFFIXES = {
     ".md",
 }
 
+AGENT_LOG_SCHEMA_VERSION = "2026-05-29-stderr-1"
+
 HIGH_RISK_UPLOAD_NAMES = (
     ".env",
     "flags.env",
@@ -274,8 +276,11 @@ class AgentLogger:
         payload = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "event": event,
+            "schema": AGENT_LOG_SCHEMA_VERSION,
             **fields,
         }
+        if os.environ.get("HSPACE_AGENT_STDERR_LOG", "1") != "0":
+            print(f"[hspace-defense-agent] {json.dumps(redact_log_payload(payload), ensure_ascii=False, sort_keys=True)}", file=sys.stderr, flush=True)
         try:
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
@@ -284,6 +289,19 @@ class AgentLogger:
             with fallback.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
             self.path = fallback
+
+
+def redact_log_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    redacted: dict[str, Any] = {}
+    for key, value in payload.items():
+        lowered = key.lower()
+        if any(marker in lowered for marker in ("token", "secret", "key", "authorization", "password")):
+            redacted[key] = "[redacted]"
+        elif isinstance(value, str) and len(value) > 700:
+            redacted[key] = value[:700] + "...[truncated]"
+        else:
+            redacted[key] = value
+    return redacted
 
 
 def resolve_agent_log_path(cli_value: str | None) -> Path:
