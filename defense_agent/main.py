@@ -120,6 +120,16 @@ class RuntimeProbe:
 
 
 @dataclass(frozen=True)
+class LLMReview:
+    enabled: bool
+    model: str
+    status: str
+    base_url_source: str | None
+    summary: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class DefenseReport:
     generated_at: str
     mode: str
@@ -131,6 +141,7 @@ class DefenseReport:
     static_checks: list[DefenseCheck]
     log_findings: list[LogFinding]
     runtime_probe: RuntimeProbe | None
+    llm_review: LLMReview | None
     hardening_policy: dict[str, Any]
 
 
@@ -142,6 +153,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default=None, help="Optional deployed service base URL")
     parser.add_argument("--log", default=None, help="Optional access/app log to inspect")
     parser.add_argument("--agent-log", default=None, help="JSONL agent execution log path")
+    parser.add_argument("--model", default=None, help="Allowed LLM model for optional review")
+    parser.add_argument("--llm-review", action="store_true", help="Ask injected LLM wrapper for a short defense review")
     parser.add_argument("--report-dir", default="defense_reports", help="Markdown report directory")
     parser.add_argument("--json-out", default=None, help="Optional JSON output path")
     parser.add_argument("--strict", action="store_true", help="Treat warnings as high-priority")
@@ -162,18 +175,25 @@ def main() -> None:
     try:
         service_root = resolve_service_root(args.service_root)
         base_url = args.base_url or os.environ.get("BASE_URL") or os.environ.get("SERVICE_BASE_URL") or os.environ.get("TARGET_BASE_URL")
+        model = args.model or os.environ.get("MODEL") or "google/gemini-2.0-flash-001"
+        llm_review_enabled = args.llm_review or os.environ.get("ENABLE_LLM_REVIEW") == "1"
         agent_log.write(
             "context_resolved",
             service_root=str(service_root),
             base_url=base_url,
             input_log=args.log,
             strict=args.strict,
+            model=model,
+            llm_review_enabled=llm_review_enabled,
         )
         report = build_report(
             service_root,
             Path(args.log).expanduser() if args.log else None,
             args.strict,
             base_url,
+            model,
+            llm_review_enabled,
+            agent_log,
         )
         report_path = write_markdown_report(Path(args.report_dir), report)
         output = report_to_json(report)
@@ -189,6 +209,7 @@ def main() -> None:
             log_findings=len(report.log_findings),
             runtime_probe=report.strategy.get("runtime_reachable"),
             runtime_probe_limited=report.strategy.get("runtime_probe_limited"),
+            llm_review_status=report.llm_review.status if report.llm_review else "not_requested",
         )
         if args.json_out:
             out = Path(args.json_out)
@@ -262,7 +283,13 @@ def resolve_service_root(cli_value: str | None) -> Path:
 
 
 def build_report(
-    service_root: Path, log_path: Path | None, strict: bool, base_url: str | None
+    service_root: Path,
+    log_path: Path | None,
+    strict: bool,
+    base_url: str | None,
+    model: str,
+    llm_review_enabled: bool,
+    agent_log: AgentLogger | None = None,
 ) -> DefenseReport:
     files = collect_text_files(service_root)
     checks = build_static_checks(service_root, files, strict)
@@ -272,6 +299,15 @@ def build_report(
     posture = posture_from_checks(checks, log_findings, runtime_probe)
     readiness = readiness_from_checks(checks, log_findings, runtime_probe)
     strategy = build_strategy(checks, log_findings, policy, runtime_probe)
+    llm_review = build_llm_review(
+        llm_review_enabled,
+        model,
+        strategy,
+        checks,
+        log_findings,
+        runtime_probe,
+        agent_log,
+    )
     return DefenseReport(
         generated_at=datetime.now(timezone.utc).isoformat(),
         mode="generic-obsidian-upload-defense",
@@ -283,6 +319,7 @@ def build_report(
         static_checks=checks,
         log_findings=log_findings,
         runtime_probe=runtime_probe,
+        llm_review=llm_review,
         hardening_policy=policy,
     )
 
@@ -679,6 +716,139 @@ def inspect_runtime(base_url: str | None) -> RuntimeProbe | None:
     )
 
 
+def build_llm_review(
+    enabled: bool,
+    model: str,
+    strategy: dict[str, Any],
+    checks: list[DefenseCheck],
+    findings: list[LogFinding],
+    runtime_probe: RuntimeProbe | None,
+    agent_log: AgentLogger | None,
+) -> LLMReview | None:
+    if not enabled:
+        return None
+    wrapper_base, source = resolve_llm_wrapper_base()
+    if not wrapper_base:
+        return LLMReview(
+            enabled=True,
+            model=model,
+            status="skipped_no_wrapper",
+            base_url_source=None,
+            error="OPENROUTER_BASE_URL or OPENAI_BASE_URL was not injected",
+        )
+    prompt = build_llm_review_prompt(strategy, checks, findings, runtime_probe)
+    if agent_log:
+        agent_log.write("llm_review_start", model=model, base_url_source=source)
+    try:
+        summary = call_llm_review(wrapper_base, model, prompt)
+        if agent_log:
+            agent_log.write("llm_review_finish", status="ok", chars=len(summary))
+        return LLMReview(
+            enabled=True,
+            model=model,
+            status="ok",
+            base_url_source=source,
+            summary=summary,
+        )
+    except Exception as exc:
+        if agent_log:
+            agent_log.write("llm_review_finish", status="error", error=str(exc)[:500])
+        return LLMReview(
+            enabled=True,
+            model=model,
+            status="error",
+            base_url_source=source,
+            error=str(exc)[:500],
+        )
+
+
+def resolve_llm_wrapper_base() -> tuple[str | None, str | None]:
+    if os.environ.get("OPENROUTER_BASE_URL"):
+        return os.environ["OPENROUTER_BASE_URL"].rstrip("/"), "OPENROUTER_BASE_URL"
+    if os.environ.get("OPENAI_BASE_URL"):
+        return os.environ["OPENAI_BASE_URL"].rstrip("/"), "OPENAI_BASE_URL"
+    return None, None
+
+
+def build_llm_review_prompt(
+    strategy: dict[str, Any],
+    checks: list[DefenseCheck],
+    findings: list[LogFinding],
+    runtime_probe: RuntimeProbe | None,
+) -> str:
+    critical = [check for check in checks if check.severity == "critical"]
+    high = [check for check in checks if check.severity == "high"]
+    payload = {
+        "role": "defense_agent_review",
+        "rules": [
+            "Do not remove features or endpoints.",
+            "Prefer small patches that keep upload, preview, list, and analysis features working.",
+            "Never hardcode current flags.",
+            "Assume patches must be performed by the agent, not by a human operator.",
+            "Return concise Korean output.",
+        ],
+        "strategy": {
+            "first_actions": strategy.get("first_actions", [])[:6],
+            "critical_gaps": strategy.get("critical_gaps", []),
+            "high_gaps": strategy.get("high_gaps", []),
+            "runtime_probe_limited": strategy.get("runtime_probe_limited"),
+        },
+        "runtime": {
+            "base_url": runtime_probe.base_url if runtime_probe else None,
+            "reachable": runtime_probe.reachable if runtime_probe else None,
+            "health_ok": runtime_probe.health_ok if runtime_probe else None,
+            "probe_limited": runtime_probe.probe_limited if runtime_probe else None,
+        },
+        "critical_checks": [compact_check(check) for check in critical],
+        "high_checks": [compact_check(check) for check in high],
+        "log_findings": [asdict(finding) for finding in findings[:8]],
+    }
+    return (
+        "You are a CTF A&D defense agent reviewer. "
+        "The model may be lightweight, so follow the JSON data literally. "
+        "Output exactly four short Korean sections: "
+        "1) 현재 판단 2) 먼저 할 자동 패치 3) 기능 유지 주의점 4) 로그로 확인할 것.\n\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+    )
+
+
+def compact_check(check: DefenseCheck) -> dict[str, Any]:
+    return {
+        "id": check.check_id,
+        "severity": check.severity,
+        "status": check.status,
+        "actions": check.immediate_actions[:2],
+        "evidence": [
+            {"file": ev.file, "line": ev.line, "text": ev.text[:120]}
+            for ev in check.evidence[:3]
+        ],
+    }
+
+
+def call_llm_review(wrapper_base: str, model: str, prompt: str) -> str:
+    body = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You produce concise defensive engineering advice. Never suggest feature deletion.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 900,
+    }
+    request = urllib.request.Request(
+        f"{wrapper_base}/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        data = json.loads(response.read().decode("utf-8", errors="ignore"))
+    return str(data["choices"][0]["message"]["content"]).strip()
+
+
 def normalize_base_url(base_url: str) -> str:
     parsed = urllib.parse.urlparse(base_url if "://" in base_url else f"http://{base_url}")
     scheme = parsed.scheme or "http"
@@ -912,6 +1082,27 @@ def write_markdown_report(report_dir: Path, report: DefenseReport) -> Path:
         f"- posture: `{report.posture}`",
         f"- readiness: `{report.readiness}`",
         "",
+        "## Model",
+        "",
+    ]
+    if report.llm_review:
+        lines.extend(
+            [
+                f"- enabled: `{report.llm_review.enabled}`",
+                f"- model: `{report.llm_review.model}`",
+                f"- status: `{report.llm_review.status}`",
+                f"- wrapper_source: `{report.llm_review.base_url_source or 'none'}`",
+                "",
+            ]
+        )
+        if report.llm_review.summary:
+            lines.extend(["LLM review:", "", report.llm_review.summary, ""])
+        elif report.llm_review.error:
+            lines.extend([f"- error: `{report.llm_review.error}`", ""])
+    else:
+        lines.extend(["- llm_review: `not requested`", ""])
+    lines.extend(
+        [
         "## Emergency Strategy",
         "",
         f"- {report.strategy['one_line']}",
@@ -925,9 +1116,14 @@ def write_markdown_report(report_dir: Path, report: DefenseReport) -> Path:
         "High gaps:",
         *[f"- {item}" for item in report.strategy["high_gaps"] or ["none"]],
         "",
+        ]
+    )
+    lines.extend(
+        [
         "## Runtime Probe",
         "",
-    ]
+        ]
+    )
     if report.runtime_probe:
         lines.extend(
             [

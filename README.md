@@ -15,6 +15,7 @@ HSPACE A&D 라운드용 방어 에이전트입니다.
 - 개인 OpenAI/OpenRouter/Anthropic API key를 코드에 넣지 않습니다.
 - public provider endpoint를 직접 호출하지 않습니다.
 - LLM이 필요해도 coordinator가 주입한 `OPENROUTER_BASE_URL` 또는 `OPENAI_BASE_URL`만 사용해야 합니다.
+- 허용 모델 제한이 있으므로 기본 LLM review 모델은 `google/gemini-2.0-flash-001`로 둡니다.
 - 현재 flag 값을 코드, 리포트, PoC에 하드코딩하지 않습니다.
 
 ## Patch Policy
@@ -66,6 +67,40 @@ HSPACE_AGENT_LOG_PATH=/tmp/defense-agent.jsonl python3 defense/main.py
 - report/json output path
 - runtime probe 제한 여부
 
+## LLM Model
+
+대회 환경에서는 개인 API key를 넣지 않습니다. 모델 호출이 필요하면 coordinator가 주입한 wrapper URL만 사용합니다.
+
+사용 모델:
+
+```text
+google/gemini-2.0-flash-001
+```
+
+실행 예:
+
+```bash
+MODEL=google/gemini-2.0-flash-001 \
+ENABLE_LLM_REVIEW=1 \
+python3 defense/main.py --service-root /path/to/obsidian-upload-service
+```
+
+또는 CLI로 명시:
+
+```bash
+python3 defense/main.py \
+  --service-root /path/to/obsidian-upload-service \
+  --llm-review \
+  --model google/gemini-2.0-flash-001
+```
+
+주의:
+
+- `OPENROUTER_BASE_URL` 또는 `OPENAI_BASE_URL`이 주입되어 있을 때만 LLM review가 실행됩니다.
+- wrapper URL이 없으면 `skipped_no_wrapper`로 기록하고 agent 자체는 계속 동작합니다.
+- `openrouter.ai`, `api.openai.com`, `api.anthropic.com` 직접 호출은 하지 않습니다.
+- 모델이 가벼운 편이라 prompt는 짧은 JSON 요약과 4개 섹션 출력으로 제한합니다.
+
 ## Run
 
 ```bash
@@ -75,6 +110,7 @@ python3 defense_agent/main.py --service-root /path/to/obsidian-upload-service
 python3 defense_agent/main.py --service-root /path/to/obsidian-upload-service --log /path/to/access.log --json-out /tmp/obsidian-defense.json
 python3 defense/main.py --service-root /path/to/obsidian-upload-service --base-url http://knights.hspace.io:42001/
 python3 defense/main.py --service-root /path/to/obsidian-upload-service --agent-log /tmp/defense-agent.jsonl
+python3 defense/main.py --service-root /path/to/obsidian-upload-service --llm-review --model google/gemini-2.0-flash-001
 ```
 
 `--service-root`를 생략하면 다음 환경변수와 일반적인 mount 경로를 순서대로 탐색합니다.
@@ -131,6 +167,7 @@ coordinator가 알 수 없는 CLI 인자를 붙여도 agent가 즉시 죽지 않
 - check별 evidence, required controls, immediate actions
 - 로그 기반 공격 흔적
 - agent 실행 JSONL 로그 경로
+- 선택 LLM review 모델과 결과
 - 배포 URL runtime probe 결과
 - 바로 적용 가능한 hardening policy JSON
 
