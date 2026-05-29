@@ -1,0 +1,11 @@
+[project]
+name = "ad-defense-agent"
+version = "0.1.0"
+description = "Python defensive agent for log detection and response planning"
+requires-python = ">=3.11"
+dependencies = [
+  "PyYAML>=6.0.2",
+]
+
+[tool.ruff]
+line-length = 100

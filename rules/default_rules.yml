@@ -1,0 +1,18 @@
+rules:
+  - id: AD-001
+    name: Suspicious PowerShell Execution
+    severity: high
+    pattern: "powershell.*-enc|encodedcommand"
+    response: "isolate host and collect process tree"
+
+  - id: AD-002
+    name: Possible Brute Force Login
+    severity: medium
+    pattern: "failed password|authentication failed|login failed"
+    response: "rate limit source and review account activity"
+
+  - id: AD-003
+    name: Web Attack Payload
+    severity: high
+    pattern: "union select|or 1=1|<script>|/etc/passwd"
+    response: "block source IP and preserve web logs"
