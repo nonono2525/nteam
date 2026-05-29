@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import tempfile
 import urllib.error
 import urllib.parse
@@ -140,6 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--service-root", default=None, help="Service repository path")
     parser.add_argument("--base-url", default=None, help="Optional deployed service base URL")
     parser.add_argument("--log", default=None, help="Optional access/app log to inspect")
+    parser.add_argument("--agent-log", default=None, help="JSONL agent execution log path")
     parser.add_argument("--report-dir", default="defense_reports", help="Markdown report directory")
     parser.add_argument("--json-out", default=None, help="Optional JSON output path")
     parser.add_argument("--strict", action="store_true", help="Treat warnings as high-priority")
@@ -150,22 +152,89 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    service_root = resolve_service_root(args.service_root)
-    base_url = args.base_url or os.environ.get("BASE_URL") or os.environ.get("SERVICE_BASE_URL") or os.environ.get("TARGET_BASE_URL")
-    report = build_report(
-        service_root,
-        Path(args.log).expanduser() if args.log else None,
-        args.strict,
-        base_url,
+    agent_log = AgentLogger(resolve_agent_log_path(args.agent_log))
+    agent_log.write(
+        "agent_start",
+        argv=sys.argv[1:],
+        unknown_args=args.unknown_args,
+        cwd=str(Path.cwd()),
     )
-    report_path = write_markdown_report(Path(args.report_dir), report)
-    output = report_to_json(report)
-    output["report_path"] = str(report_path)
-    if args.json_out:
-        out = Path(args.json_out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(output, ensure_ascii=False, indent=2))
+    try:
+        service_root = resolve_service_root(args.service_root)
+        base_url = args.base_url or os.environ.get("BASE_URL") or os.environ.get("SERVICE_BASE_URL") or os.environ.get("TARGET_BASE_URL")
+        agent_log.write(
+            "context_resolved",
+            service_root=str(service_root),
+            base_url=base_url,
+            input_log=args.log,
+            strict=args.strict,
+        )
+        report = build_report(
+            service_root,
+            Path(args.log).expanduser() if args.log else None,
+            args.strict,
+            base_url,
+        )
+        report_path = write_markdown_report(Path(args.report_dir), report)
+        output = report_to_json(report)
+        output["report_path"] = str(report_path)
+        output["agent_log_path"] = str(agent_log.path)
+        agent_log.write(
+            "report_generated",
+            posture=report.posture,
+            readiness=report.readiness,
+            report_path=str(report_path),
+            critical_gaps=report.strategy.get("critical_gaps", []),
+            high_gaps=report.strategy.get("high_gaps", []),
+            log_findings=len(report.log_findings),
+            runtime_probe=report.strategy.get("runtime_reachable"),
+            runtime_probe_limited=report.strategy.get("runtime_probe_limited"),
+        )
+        if args.json_out:
+            out = Path(args.json_out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+            agent_log.write("json_written", path=str(out))
+        agent_log.write("agent_finish", status="ok")
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+    except Exception as exc:
+        agent_log.write("agent_error", error_type=type(exc).__name__, error=str(exc)[:500])
+        raise
+
+
+class AgentLogger:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            self.path = Path(tempfile.gettempdir()) / "hspace_defense_agent.jsonl"
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write(self, event: str, **fields: Any) -> None:
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            **fields,
+        }
+        try:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        except OSError:
+            fallback = Path(tempfile.gettempdir()) / "hspace_defense_agent.jsonl"
+            with fallback.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+            self.path = fallback
+
+
+def resolve_agent_log_path(cli_value: str | None) -> Path:
+    raw = (
+        cli_value
+        or os.environ.get("AGENT_LOG_PATH")
+        or os.environ.get("HSPACE_AGENT_LOG_PATH")
+        or str(Path(tempfile.gettempdir()) / "hspace_defense_agent.jsonl")
+    )
+    return Path(raw).expanduser()
 
 
 def resolve_service_root(cli_value: str | None) -> Path:
