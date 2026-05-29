@@ -1,18 +1,42 @@
 rules:
-  - id: AD-001
-    name: Suspicious PowerShell Execution
+  - id: OBS-001
+    name: Vault Path Traversal Probe
     severity: high
-    pattern: "powershell.*-enc|encodedcommand"
-    response: "isolate host and collect process tree"
+    pattern: "(\\.\\./|\\.\\.\\\\|%2e%2e|%252e%252e)"
+    response: "block request, quarantine related upload, and verify safe_join plus owner checks"
 
-  - id: AD-002
-    name: Possible Brute Force Login
+  - id: OBS-002
+    name: Secret File Probe
+    severity: high
+    pattern: "(\\.env|flags\\.env|id_rsa|id_ed25519|/etc/passwd|/proc/self/environ)"
+    response: "block request and enforce dotfile/secret filename denylist"
+
+  - id: OBS-003
+    name: Markdown XSS Payload
+    severity: high
+    pattern: "(<script|javascript:|onerror=|onload=|<iframe|data:text/html)"
+    response: "quarantine note and verify markdown sanitizer plus CSP"
+
+  - id: OBS-004
+    name: Obsidian Plugin or Embed Abuse
+    severity: high
+    pattern: "(\\.obsidian/plugins|\\.obsidian/workspace|!\\[\\[|\\[\\[.*\\]\\])"
+    response: "reject plugin paths and resolve embeds only through sanitized vault manifest"
+
+  - id: OBS-005
+    name: Archive Extraction Attack
+    severity: high
+    pattern: "(zip|tar|7z).*(\\.\\./|\\.\\.\\\\|%2e%2e|symlink|zip bomb)"
+    response: "quarantine archive and inspect extractor for zip-slip, symlink, and size limit checks"
+
+  - id: OBS-006
+    name: Debug or Admin Surface Probe
     severity: medium
-    pattern: "failed password|authentication failed|login failed"
-    response: "rate limit source and review account activity"
+    pattern: "(/debug|/admin|/internal|x-debug|x-service-key|x-forwarded-for.*127\\.0\\.0\\.1)"
+    response: "verify admin routes use server-side auth and do not trust client-supplied internal headers"
 
-  - id: AD-003
-    name: Web Attack Payload
+  - id: OBS-007
+    name: Markdown SSRF or Local URL Probe
     severity: high
-    pattern: "union select|or 1=1|<script>|/etc/passwd"
-    response: "block source IP and preserve web logs"
+    pattern: "(169\\.254\\.169\\.254|file://|gopher://|ftp://|localhost|127\\.0\\.0\\.1)"
+    response: "deny remote fetches from markdown unless strict URL allowlist is present"
