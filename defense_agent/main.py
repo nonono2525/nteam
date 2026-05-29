@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -187,7 +188,7 @@ def main() -> None:
         cwd=str(Path.cwd()),
     )
     try:
-        service_root = resolve_service_root(args.service_root)
+        service_root = prepare_service_root(args.service_root, agent_log)
         base_url = args.base_url or os.environ.get("BASE_URL") or os.environ.get("SERVICE_BASE_URL") or os.environ.get("TARGET_BASE_URL")
         model = args.model or os.environ.get("MODEL") or "google/gemini-2.0-flash-001"
         llm_review_enabled = args.llm_review or os.environ.get("ENABLE_LLM_REVIEW") == "1"
@@ -317,6 +318,59 @@ def resolve_service_root(cli_value: str | None) -> Path:
         if path.exists() and (path / "vuln_spec.json").exists():
             return path
     return Path.cwd().resolve()
+
+
+def has_explicit_service_root(cli_value: str | None) -> bool:
+    return bool(
+        cli_value
+        or os.environ.get("SERVICE_ROOT")
+        or os.environ.get("TEAM_PROJECT_ROOT")
+        or os.environ.get("TARGET_SERVICE_ROOT")
+        or os.environ.get("HSPACE_SERVICE_ROOT")
+    )
+
+
+def repo_url_with_run_token(repo_url: str) -> str:
+    token = os.environ.get("AGENT_RUN_TOKEN", "")
+    parsed = urllib.parse.urlsplit(repo_url)
+    if not token or parsed.scheme not in {"http", "https"} or parsed.username:
+        return repo_url
+    quoted = urllib.parse.quote(token, safe="")
+    netloc = f"agent:{quoted}@{parsed.netloc}"
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
+def prepare_service_root(cli_value: str | None, agent_log: AgentLogger) -> Path:
+    if has_explicit_service_root(cli_value):
+        return resolve_service_root(cli_value)
+
+    target_repo_url = os.environ.get("TARGET_REPO_URL", "").strip()
+    run_id = os.environ.get("AGENT_RUN_ID", "").strip()
+    if target_repo_url and run_id:
+        safe_run_id = re.sub(r"[^A-Za-z0-9_.-]", "_", run_id)[:64] or "run"
+        clone_root = Path(tempfile.gettempdir()) / f"hspace_target_repo_{safe_run_id}"
+        try:
+            if clone_root.exists():
+                shutil.rmtree(clone_root)
+            clone_url = repo_url_with_run_token(target_repo_url)
+            clone = subprocess.run(
+                ["git", "clone", "--depth", "1", clone_url, str(clone_root)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if clone.returncode == 0:
+                agent_log.write("target_repo_cloned", path=str(clone_root))
+                return resolve_service_root(str(clone_root))
+            agent_log.write(
+                "target_repo_clone_failed",
+                returncode=clone.returncode,
+                stderr=(clone.stderr or "")[-500:],
+            )
+        except Exception as exc:
+            agent_log.write("target_repo_clone_exception", error=str(exc)[:500])
+
+    return resolve_service_root(cli_value)
 
 
 TEAM1_VULN_PATCHES = [
@@ -641,6 +695,8 @@ def commit_and_push_patches(service_root: Path, patch_result: PatchResult, agent
         + f"\n\nAgent-Run-ID: {run_id}"
     )
     try:
+        subprocess.run(["git", "-C", str(service_root), "config", "user.name", "HSPACE Defense Agent"], check=False, capture_output=True, text=True)
+        subprocess.run(["git", "-C", str(service_root), "config", "user.email", "defense-agent@hspace.local"], check=False, capture_output=True, text=True)
         subprocess.run(["git", "-C", str(service_root), "add", "-A"], check=True, capture_output=True, text=True)
         commit = subprocess.run(
             ["git", "-C", str(service_root), "commit", "-m", message],
