@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import urllib.error
@@ -130,6 +131,16 @@ class LLMReview:
 
 
 @dataclass(frozen=True)
+class PatchResult:
+    applied: bool
+    changed_files: list[str]
+    actions: list[str]
+    issues: list[str]
+    committed: bool = False
+    pushed: bool = False
+
+
+@dataclass(frozen=True)
 class DefenseReport:
     generated_at: str
     mode: str
@@ -143,6 +154,7 @@ class DefenseReport:
     runtime_probe: RuntimeProbe | None
     llm_review: LLMReview | None
     hardening_policy: dict[str, Any]
+    patch_result: PatchResult | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -158,6 +170,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report-dir", default="defense_reports", help="Markdown report directory")
     parser.add_argument("--json-out", default=None, help="Optional JSON output path")
     parser.add_argument("--strict", action="store_true", help="Treat warnings as high-priority")
+    parser.add_argument("--apply-patches", action="store_true", help="Apply safe automatic patches before reporting")
+    parser.add_argument("--no-push", action="store_true", help="Do not commit/push even when patches changed files")
     args, unknown = parser.parse_known_args()
     args.unknown_args = unknown
     return args
@@ -177,6 +191,11 @@ def main() -> None:
         base_url = args.base_url or os.environ.get("BASE_URL") or os.environ.get("SERVICE_BASE_URL") or os.environ.get("TARGET_BASE_URL")
         model = args.model or os.environ.get("MODEL") or "google/gemini-2.0-flash-001"
         llm_review_enabled = args.llm_review or os.environ.get("ENABLE_LLM_REVIEW") == "1"
+        auto_patch = (
+            args.apply_patches
+            or os.environ.get("ENABLE_AUTO_PATCH") == "1"
+            or bool(os.environ.get("AGENT_RUN_ID"))
+        )
         agent_log.write(
             "context_resolved",
             service_root=str(service_root),
@@ -185,7 +204,14 @@ def main() -> None:
             strict=args.strict,
             model=model,
             llm_review_enabled=llm_review_enabled,
+            auto_patch=auto_patch,
         )
+        patch_result = None
+        if auto_patch:
+            patch_result = apply_safe_patches(service_root, agent_log)
+            if patch_result.issues:
+                agent_log.write("patch_failed", issues=patch_result.issues[:10])
+                raise RuntimeError(f"automatic patch verification failed: {patch_result.issues[:3]}")
         report = build_report(
             service_root,
             Path(args.log).expanduser() if args.log else None,
@@ -194,6 +220,7 @@ def main() -> None:
             model,
             llm_review_enabled,
             agent_log,
+            patch_result,
         )
         report_path = write_markdown_report(Path(args.report_dir), report)
         output = report_to_json(report)
@@ -210,6 +237,8 @@ def main() -> None:
             runtime_probe=report.strategy.get("runtime_reachable"),
             runtime_probe_limited=report.strategy.get("runtime_probe_limited"),
             llm_review_status=report.llm_review.status if report.llm_review else "not_requested",
+            patch_applied=patch_result.applied if patch_result else False,
+            patch_changed_files=patch_result.changed_files if patch_result else [],
         )
         if args.json_out:
             out = Path(args.json_out)
@@ -218,6 +247,14 @@ def main() -> None:
             agent_log.write("json_written", path=str(out))
         agent_log.write("agent_finish", status="ok")
         print(json.dumps(output, ensure_ascii=False, indent=2))
+        if patch_result and patch_result.changed_files and not args.no_push:
+            final_patch_result = commit_and_push_patches(service_root, patch_result, agent_log)
+            agent_log.write(
+                "patch_commit_finish",
+                committed=final_patch_result.committed,
+                pushed=final_patch_result.pushed,
+                changed_files=final_patch_result.changed_files,
+            )
     except Exception as exc:
         agent_log.write("agent_error", error_type=type(exc).__name__, error=str(exc)[:500])
         raise
@@ -282,6 +319,348 @@ def resolve_service_root(cli_value: str | None) -> Path:
     return Path.cwd().resolve()
 
 
+TEAM1_VULN_PATCHES = [
+    (
+        "vuln1_search_cache",
+        "main.py",
+        '''\
+def _get_search_result(query: str) -> str:
+    """검색 캐시 조회. inject로 오염된 캐시가 있으면 그것을 반환."""
+    if _vuln_flags["vuln1"] and "vuln1" in _search_cache:
+        # 오염된 캐시: flag가 숨겨진 검색 결과 반환
+        return _search_cache["vuln1"]
+    return f"'{query}'에 대한 일반 검색 결과입니다."''',
+        '''\
+def _get_search_result(query: str) -> str:
+    """검색 캐시 조회. 일반 검색 결과만 반환한다."""
+    return f"'{query}'에 대한 일반 검색 결과입니다."''',
+    ),
+    (
+        "vuln2_memory_filter",
+        "main.py",
+        '''\
+    elif "기록" in lower or "이전" in lower or "history" in lower:
+        memories = "\\n".join(_session_memory)
+        tool_calls.append({"tool": "recall_memory", "result": memories})
+        response = f"기억하고 있는 내용:\\n{memories}" if memories else "저장된 기록이 없습니다."''',
+        '''\
+    elif "기록" in lower or "이전" in lower or "history" in lower:
+        memories = "\\n".join(
+            item for item in _session_memory
+            if not item.startswith("[시스템 메모:")
+        )
+        tool_calls.append({"tool": "recall_memory", "result": memories})
+        response = f"기억하고 있는 내용:\\n{memories}" if memories else "저장된 기록이 없습니다."''',
+    ),
+    (
+        "vuln3_admin_todo_filter",
+        "main.py",
+        '''\
+        if "다른 사용자" in lower or "모든" in lower or "admin" in lower:
+            # 권한 체크 누락 — admin 데이터까지 반환
+            all_todos = dict(_todo_db)
+            tool_calls.append({"tool": "list_todos", "result": all_todos})
+            response = f"전체 할 일: {all_todos}"''',
+        '''\
+        if "다른 사용자" in lower or "모든" in lower or "admin" in lower:
+            all_todos = {key: value for key, value in _todo_db.items() if key != "admin"}
+            tool_calls.append({"tool": "list_todos", "result": all_todos})
+            response = f"전체 할 일: {all_todos}"''',
+    ),
+    (
+        "vuln4_debug_secret_filter",
+        "main.py",
+        '''\
+    elif "디버그" in lower or "debug" in lower or "툴 상태" in lower:
+        debug_state = dict(_tool_debug_tokens)
+        tool_calls.append({"tool": "debug_dump", "result": debug_state})
+        response = f"디버그 툴 상태: {debug_state}"''',
+        '''\
+    elif "디버그" in lower or "debug" in lower or "툴 상태" in lower:
+        debug_state = {
+            key: value for key, value in _tool_debug_tokens.items()
+            if key != "tool_secret"
+        }
+        tool_calls.append({"tool": "debug_dump", "result": debug_state})
+        response = f"디버그 툴 상태: {debug_state}"''',
+    ),
+]
+
+
+SECURITY_MIDDLEWARE = '''\
+
+# HSPACE defense agent hardening: browser security headers.
+@app.middleware("http")
+async def _hspace_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    )
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
+'''
+
+
+UPLOAD_GUARD_OLD = '''\
+async def upload_markdown_zip(request: Request):
+    file_name = request.headers.get("X-File-Name", "").strip()
+    if file_name and not file_name.lower().endswith(".zip"):
+        raise HTTPException(400, "ZIP 파일만 업로드할 수 있습니다.")
+
+    raw_zip = await request.body()
+    if not raw_zip:
+        raise HTTPException(400, "업로드된 파일이 비어 있습니다.")
+
+    entries = extract_md_entries(raw_zip)
+    if not entries:
+        raise HTTPException(400, "ZIP 안에 Markdown(.md) 파일이 없습니다.")'''
+
+UPLOAD_GUARD_NEW = '''\
+async def upload_markdown_zip(request: Request):
+    file_name = request.headers.get("X-File-Name", "").strip()
+    if file_name and not file_name.lower().endswith(".zip"):
+        raise HTTPException(400, "ZIP 파일만 업로드할 수 있습니다.")
+
+    max_zip_bytes = int(os.getenv("MAX_VAULT_ZIP_BYTES", "20000000"))
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > max_zip_bytes:
+        raise HTTPException(413, "업로드 ZIP 크기가 너무 큽니다.")
+
+    raw_zip = await request.body()
+    if not raw_zip:
+        raise HTTPException(400, "업로드된 파일이 비어 있습니다.")
+    if len(raw_zip) > max_zip_bytes:
+        raise HTTPException(413, "업로드 ZIP 크기가 너무 큽니다.")
+
+    entries = extract_md_entries(raw_zip)
+    entries = [entry for entry in entries if _hspace_safe_markdown_entry(entry)]
+    if not entries:
+        raise HTTPException(400, "ZIP 안에 안전한 Markdown(.md) 파일이 없습니다.")'''
+
+
+SAFE_ENTRY_HELPER = '''\
+
+# HSPACE defense agent hardening: keep upload/preview features while rejecting dangerous vault entries.
+def _hspace_safe_markdown_entry(entry: dict) -> bool:
+    rel_path = str(entry.get("rel_path") or entry.get("file_path") or "").replace("\\\\", "/")
+    if not rel_path:
+        return False
+    parts = [part for part in rel_path.split("/") if part]
+    lowered_parts = [part.lower() for part in parts]
+    lowered_path = rel_path.lower()
+    denied_names = {".env", "flags.env", "id_rsa", "id_ed25519", "config.yml", "config.yaml", "docker-compose.yml"}
+    denied_dirs = {".obsidian", ".trash", "__macosx"}
+    if rel_path.startswith("/") or any(part in {"..", "."} for part in parts):
+        return False
+    if any(part in denied_names for part in lowered_parts):
+        return False
+    if any(part in denied_dirs for part in lowered_parts):
+        return False
+    if not lowered_path.endswith((".md", ".markdown")):
+        return False
+    if len(parts) > 12 or len(rel_path) > 240:
+        return False
+    data = entry.get("bytes", b"")
+    if isinstance(data, bytes) and len(data) > int(os.getenv("MAX_MARKDOWN_FILE_BYTES", "1000000")):
+        return False
+    return True
+'''
+
+
+def apply_safe_patches(service_root: Path, agent_log: AgentLogger) -> PatchResult:
+    backups: dict[Path, str] = {}
+    changed: list[str] = []
+    actions: list[str] = []
+    issues: list[str] = []
+
+    def remember(path: Path) -> str:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        backups.setdefault(path, text)
+        return text
+
+    def write_if_changed(path: Path, before: str, after: str, action: str) -> None:
+        if before == after:
+            return
+        path.write_text(after, encoding="utf-8")
+        rel = str(path.relative_to(service_root)) if path.is_relative_to(service_root) else str(path)
+        if rel not in changed:
+            changed.append(rel)
+        actions.append(action)
+        agent_log.write("patch_applied", file=rel, action=action)
+
+    main_py = service_root / "main.py"
+    if main_py.exists():
+        content = remember(main_py)
+        patched = content
+        for patch_id, _rel, old, new in TEAM1_VULN_PATCHES:
+            if old in patched:
+                patched = patched.replace(old, new, 1)
+                actions.append(f"{patch_id}: exact patch")
+            else:
+                patched = apply_team1_fallback_patch(patch_id, patched, actions)
+        if "app = FastAPI()" in patched and "_hspace_security_headers" not in patched:
+            patched = patched.replace("app = FastAPI()", "app = FastAPI()" + SECURITY_MIDDLEWARE, 1)
+        if UPLOAD_GUARD_OLD in patched and "_hspace_safe_markdown_entry" not in patched:
+            insert_at = patched.find('@app.post("/api/markdown/upload")')
+            if insert_at != -1:
+                patched = patched[:insert_at] + SAFE_ENTRY_HELPER + "\n" + patched[insert_at:]
+            patched = patched.replace(UPLOAD_GUARD_OLD, UPLOAD_GUARD_NEW, 1)
+        write_if_changed(main_py, content, patched, "main.py safe response/upload/security hardening")
+
+    parser_py = service_root / "scripts" / "md_parser.py"
+    if parser_py.exists():
+        content = remember(parser_py)
+        patched = content
+        if "def _sanitize_markdown_content(" not in patched:
+            patched = patched.replace(
+                "_KEYWORD_STOPWORDS = {",
+                MARKDOWN_SANITIZER_HELPER + "\n\n_KEYWORD_STOPWORDS = {",
+                1,
+            )
+        if 'content = file_bytes.decode("utf-8", errors="replace")' in patched and "_sanitize_markdown_content(content)" not in patched:
+            patched = patched.replace(
+                'content = file_bytes.decode("utf-8", errors="replace")',
+                'content = _sanitize_markdown_content(file_bytes.decode("utf-8", errors="replace"))',
+                1,
+            )
+        write_if_changed(parser_py, content, patched, "markdown sanitizer hardening")
+
+    if changed:
+        issues.extend(verify_patch_safety(service_root))
+        if issues:
+            for path, text in backups.items():
+                path.write_text(text, encoding="utf-8")
+            agent_log.write("patch_rollback", issues=issues[:10], files=changed)
+            return PatchResult(False, [], actions, issues)
+    return PatchResult(bool(changed), changed, actions, issues)
+
+
+MARKDOWN_SANITIZER_HELPER = '''\
+_HSPACE_DANGEROUS_MARKDOWN_RE = re.compile(
+    r"(?is)<\\s*(script|iframe|object|embed|style|meta|link)[^>]*>.*?<\\s*/\\s*\\1\\s*>"
+    r"|<\\s*(script|iframe|object|embed|style|meta|link)[^>]*?/?>"
+    r"|\\s+on[a-z]+\\s*=\\s*(['\\\"]).*?\\3"
+    r"|javascript\\s*:"
+    r"|data\\s*:\\s*text/html"
+)
+
+
+def _sanitize_markdown_content(content: str) -> str:
+    return _HSPACE_DANGEROUS_MARKDOWN_RE.sub("", content)
+'''
+
+
+def apply_team1_fallback_patch(patch_id: str, content: str, actions: list[str]) -> str:
+    replacements = {
+        "vuln2_memory_filter": (
+            '        memories = "\\n".join(_session_memory)',
+            '''\
+        memories = "\\n".join(
+            item for item in _session_memory
+            if not item.startswith("[시스템 메모:")
+        )''',
+        ),
+        "vuln3_admin_todo_filter": (
+            "            all_todos = dict(_todo_db)",
+            '            all_todos = {key: value for key, value in _todo_db.items() if key != "admin"}',
+        ),
+        "vuln4_debug_secret_filter": (
+            "        debug_state = dict(_tool_debug_tokens)",
+            '''\
+        debug_state = {
+            key: value for key, value in _tool_debug_tokens.items()
+            if key != "tool_secret"
+        }''',
+        ),
+    }
+    if patch_id == "vuln1_search_cache" and 'return _search_cache["vuln1"]' in content:
+        pattern = re.compile(
+            r'def _get_search_result\(query: str\) -> str:\n'
+            r'    """[^"]*"""\n'
+            r'    if _vuln_flags\["vuln1"\] and "vuln1" in _search_cache:\n'
+            r'        #[^\n]*\n'
+            r'        return _search_cache\["vuln1"\]\n'
+            r'    return f"\'\{query\}\'에 대한 일반 검색 결과입니다\."',
+            re.MULTILINE,
+        )
+        patched, count = pattern.subn(TEAM1_VULN_PATCHES[0][3], content, count=1)
+        if count:
+            actions.append(f"{patch_id}: fallback function patch")
+            return patched
+    old_new = replacements.get(patch_id)
+    if old_new and old_new[0] in content:
+        actions.append(f"{patch_id}: fallback sink patch")
+        return content.replace(old_new[0], old_new[1], 1)
+    return content
+
+
+def verify_patch_safety(service_root: Path) -> list[str]:
+    issues: list[str] = []
+    main_py = service_root / "main.py"
+    if main_py.exists():
+        text = main_py.read_text(encoding="utf-8", errors="ignore")
+        for marker in [
+            'return _search_cache["vuln1"]',
+            'memories = "\\n".join(_session_memory)',
+            "all_todos = dict(_todo_db)",
+            "debug_state = dict(_tool_debug_tokens)",
+        ]:
+            if marker in text:
+                issues.append(f"unsafe marker remains: {marker}")
+        for marker in [
+            '@app.post("/api/markdown/upload")',
+            '@app.get("/api/markdown/list")',
+            '@app.post("/api/markdown/preview")',
+        ]:
+            if marker not in text:
+                issues.append(f"required endpoint marker missing: {marker}")
+    for rel in ["main.py", "scripts/md_parser.py"]:
+        path = service_root / rel
+        if path.exists() and path.suffix == ".py":
+            result = subprocess.run(
+                [sys.executable, "-m", "py_compile", str(path)],
+                cwd=service_root,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                issues.append((result.stderr or result.stdout)[-500:])
+    return issues
+
+
+def commit_and_push_patches(service_root: Path, patch_result: PatchResult, agent_log: AgentLogger) -> PatchResult:
+    run_id = os.environ.get("AGENT_RUN_ID", "")
+    if not run_id:
+        agent_log.write("patch_push_skipped", reason="missing_agent_run_id")
+        return patch_result
+    message = (
+        "defense: auto harden obsidian upload service\n\n"
+        + "\n".join(f"- {action}" for action in patch_result.actions[:12])
+        + f"\n\nAgent-Run-ID: {run_id}"
+    )
+    try:
+        subprocess.run(["git", "-C", str(service_root), "add", "-A"], check=True, capture_output=True, text=True)
+        commit = subprocess.run(
+            ["git", "-C", str(service_root), "commit", "-m", message],
+            capture_output=True,
+            text=True,
+        )
+        committed = commit.returncode == 0 or "nothing to commit" in (commit.stdout + commit.stderr)
+        if not committed:
+            agent_log.write("patch_commit_failed", stderr=commit.stderr[-500:], stdout=commit.stdout[-500:])
+            return PatchResult(patch_result.applied, patch_result.changed_files, patch_result.actions, patch_result.issues, False, False)
+        push = subprocess.run(["git", "-C", str(service_root), "push"], capture_output=True, text=True)
+        pushed = push.returncode == 0
+        if not pushed:
+            agent_log.write("patch_push_failed", stderr=push.stderr[-500:], stdout=push.stdout[-500:])
+        return PatchResult(patch_result.applied, patch_result.changed_files, patch_result.actions, patch_result.issues, committed, pushed)
+    except Exception as exc:
+        agent_log.write("patch_commit_exception", error=str(exc)[:500])
+        return PatchResult(patch_result.applied, patch_result.changed_files, patch_result.actions, patch_result.issues, False, False)
+
+
 def build_report(
     service_root: Path,
     log_path: Path | None,
@@ -290,6 +669,7 @@ def build_report(
     model: str,
     llm_review_enabled: bool,
     agent_log: AgentLogger | None = None,
+    patch_result: PatchResult | None = None,
 ) -> DefenseReport:
     files = collect_text_files(service_root)
     checks = build_static_checks(service_root, files, strict)
@@ -321,6 +701,7 @@ def build_report(
         runtime_probe=runtime_probe,
         llm_review=llm_review,
         hardening_policy=policy,
+        patch_result=patch_result,
     )
 
 
@@ -1101,6 +1482,25 @@ def write_markdown_report(report_dir: Path, report: DefenseReport) -> Path:
             lines.extend([f"- error: `{report.llm_review.error}`", ""])
     else:
         lines.extend(["- llm_review: `not requested`", ""])
+    lines.extend(["## Patch Result", ""])
+    if report.patch_result:
+        lines.extend(
+            [
+                f"- applied: `{report.patch_result.applied}`",
+                f"- committed: `{report.patch_result.committed}`",
+                f"- pushed: `{report.patch_result.pushed}`",
+                f"- changed_files: `{', '.join(report.patch_result.changed_files) or 'none'}`",
+                "",
+                "Actions:",
+                *[f"- {item}" for item in report.patch_result.actions or ["none"]],
+                "",
+                "Issues:",
+                *[f"- {item}" for item in report.patch_result.issues or ["none"]],
+                "",
+            ]
+        )
+    else:
+        lines.extend(["- patch mode: `not enabled`", ""])
     lines.extend(
         [
         "## Emergency Strategy",

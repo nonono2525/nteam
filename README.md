@@ -104,8 +104,8 @@ python3 defense/main.py \
 ## Run
 
 ```bash
-python3 defense/main.py --service-root /path/to/obsidian-upload-service
-python3 agent/main.py --service-root /path/to/obsidian-upload-service
+python3 defense/main.py --service-root /path/to/obsidian-upload-service --apply-patches
+python3 agent/main.py --service-root /path/to/obsidian-upload-service --apply-patches
 python3 defense_agent/main.py --service-root /path/to/obsidian-upload-service
 python3 defense_agent/main.py --service-root /path/to/obsidian-upload-service --log /path/to/access.log --json-out /tmp/obsidian-defense.json
 python3 defense/main.py --service-root /path/to/obsidian-upload-service --base-url http://knights.hspace.io:42001/
@@ -128,6 +128,24 @@ HSPACE_SERVICE_ROOT
 `--base-url`를 넘기면 배포된 서비스에 정상 GET만 보내서 root, `/health`, 주요 Markdown API, debug/admin 노출 여부, 보안 헤더 상태를 확인합니다. 공격 payload나 특수 header는 보내지 않습니다. 실행 환경의 DNS/network 제한으로 probe가 막히면 서비스 다운으로 단정하지 않고 `runtime_probe_limited`로 표시합니다.
 
 coordinator가 알 수 없는 CLI 인자를 붙여도 agent가 즉시 죽지 않도록 unknown args는 무시합니다.
+
+## Automatic Patch Mode
+
+agent는 공식 runner에서 `AGENT_RUN_ID`가 주입되면 자동으로 안전 패치 모드에 들어갑니다. 로컬 검증에서는 `--apply-patches`를 명시합니다.
+
+```bash
+python3 agent/main.py --service-root /path/to/service --apply-patches --no-push
+```
+
+패치 원칙:
+
+- `/chat`, Markdown upload/list/preview 등 기존 기능과 endpoint를 삭제하지 않습니다.
+- Team1의 flag 누출 sink는 응답에서 secret만 제거합니다.
+- Obsidian ZIP 업로드는 유지하되, path traversal, dotfile, `.obsidian`, 위험 확장자, 과대 파일만 거절합니다.
+- Markdown preview 기능은 유지하되, script/iframe/event handler/javascript URL은 sanitizer로 제거합니다.
+- FastAPI 앱이면 CSP, nosniff, Referrer-Policy header middleware를 추가합니다.
+- 패치 후 `main.py`, `scripts/md_parser.py` 문법 검사와 endpoint marker 검증을 통과하지 못하면 즉시 롤백합니다.
+- 공식 runner에서 `AGENT_RUN_ID`가 있으면 `Agent-Run-ID` trailer가 붙은 커밋을 만들고 `git push`를 시도합니다.
 
 ## Entrypoints
 
